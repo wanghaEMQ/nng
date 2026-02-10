@@ -13,6 +13,7 @@
 #include "platform/posix/posix_impl.h"
 #include <sys/errno.h>
 #include <sys/types.h>
+#include <stdio.h>
 
 #ifdef NNG_PLATFORM_POSIX
 #include "platform/posix/posix_pollq.h"
@@ -346,6 +347,16 @@ nni_plat_udp_open(nni_plat_udp **upp, const nni_sockaddr *bindaddr)
 		NNI_FREE_STRUCT(udp);
 		return (rv);
 	}
+
+	int reuse = 1;
+	rv = setsockopt(udp->udp_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+	if (rv != 0)
+		fprintf(stderr, "error set SO_REUSEADDR %d\n", rv);
+	rv = setsockopt(udp->udp_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+	if (rv != 0)
+		fprintf(stderr, "error set SO_REUSEPORT %d\n", rv);
+	// int loop = 0;
+	// setsockopt(udp->udp_fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
 
 	if (bind(udp->udp_fd, (void *) &sa, salen) != 0) {
 		rv = nni_plat_errno(errno);
