@@ -8,6 +8,11 @@
 #include "../../../core/nng_impl.h"
 
 #include <string.h>
+#include <stdio.h>
+
+#ifndef _WIN32
+#include <arpa/inet.h> // for endianness functions
+#endif
 
 // Experimental UDP transport.  Unicast only.
 typedef struct udp_pipe udp_pipe;
@@ -20,6 +25,7 @@ enum udp_opcode {
 	OPCODE_CACK = 2,
 	OPCODE_DISC = 3,
 	OPCODE_MESH = 4,
+	OPCODE_MACK = 5, // MESH ACK
 };
 
 // Disconnect reason, must be 16 bits
@@ -54,11 +60,29 @@ typedef enum udp_disc_reason {
 #define NNG_UDP_REFRESH (5 * NNI_SECOND)
 #endif
 
+#ifndef NNG_UDP_MESH_REFRESH
+#define NNG_UDP_MESH_REFRESH (5 * NNI_SECOND)
+#endif
+
+#ifndef NNG_UDP_MESH_TIMEOUT
+#define NNG_UDP_MESH_TIMEOUT (3 * NNG_UDP_MESH_REFRESH)
+#endif
+
 #ifndef NNG_UDP_CONNRETRY
 #define NNG_UDP_CONNRETRY (NNI_SECOND / 5)
 #endif
 
 #define UDP_EP_ROLE(ep) ((ep)->dialer ? "dialer  " : "listener")
+
+// Mesh discovery multicast addresses
+#ifndef NNG_UDP_MESH_MCAST_ADDR_V4
+#define NNG_UDP_MESH_MCAST_ADDR_V4 "239.255.66.85" // 239.255.B.U.S
+#endif
+
+// Mesh discovery port (default)
+#ifndef NNG_UDP_MESH_PORT
+#define NNG_UDP_MESH_PORT 5555
+#endif
 
 // NB: Each of the following messages is exactly 20 bytes in size
 
@@ -157,6 +181,11 @@ struct udp_ep {
 	nni_sockaddr  self_sa;    // our address
 	nni_sockaddr  peer_sa;    // peer address, only for dialer;
 	nni_sockaddr  mesh_sa;    // mesh source address (ours)
+	nni_sockaddr  mesh_mcast_addr; // mesh group address
+	nni_aio       mesh_timeaio;
+	bool          ismesh;
+	nni_id_map    mesh_pipes;  // pipes (indexed by id)
+	nng_time      next_mesh;
 	nni_list      connaios;   // aios from accept waiting for a client peer
 	nni_list      connpipes;  // pipes waiting to be connected
 	nng_duration  refresh; // refresh interval for connections in seconds
@@ -193,6 +222,8 @@ static void udp_send_disc(udp_ep *ep, udp_pipe *p, udp_disc_reason reason);
 static void    udp_ep_match(udp_ep *ep);
 static nng_err udp_add_pipe(udp_ep *ep, udp_pipe *p);
 static void    udp_remove_pipe(udp_pipe *p);
+static nng_err udp_add_mesh_pipe(udp_ep *ep, udp_pipe *p);
+static void    udp_remove_mesh_pipe(udp_pipe *p);
 
 static void
 udp_tran_init(void)
@@ -222,6 +253,22 @@ udp_pipe_close(void *arg)
 }
 
 static void
+udp_mesh_pipe_close(void *arg)
+{
+	udp_pipe *p  = arg;
+	udp_ep   *ep = p->ep;
+	nni_aio  *aio;
+
+	nni_mtx_lock(&ep->mtx);
+	udp_remove_mesh_pipe(p);
+	while ((aio = nni_list_first(&p->rx_aios)) != NULL) {
+		nni_aio_list_remove(aio);
+		nni_aio_finish_error(aio, NNG_ECLOSED);
+	}
+	nni_mtx_unlock(&ep->mtx);
+}
+
+static void
 udp_pipe_stop(void *arg)
 {
 	udp_pipe *p  = arg;
@@ -242,6 +289,20 @@ udp_pipe_init(void *arg, nni_pipe *npipe)
 	nni_aio_list_init(&p->rx_aios);
 	nni_lmq_init(&p->rx_mq, NNG_UDP_RXQUEUE_LEN);
 	return (0);
+}
+
+static nng_err
+udp_mesh_pipe_start(udp_pipe *p, udp_ep *ep, const nng_sockaddr *sa)
+{
+	nni_time now = nni_clock();
+	p->ep        = ep;
+	p->proto     = ep->proto;
+	p->peer      = ep->peer;
+	p->peer_addr = *sa;
+	p->id        = nng_sockaddr_hash(sa);
+	p->expire    = now + NNG_UDP_MESH_TIMEOUT;
+
+	return (udp_add_mesh_pipe(ep, p));
 }
 
 static nng_err
@@ -355,6 +416,73 @@ udp_add_pipe(udp_ep *ep, udp_pipe *p)
 		}
 	}
 	return (nni_id_set(&ep->pipes, id, p));
+}
+
+static udp_pipe *
+udp_find_mesh_pipe(udp_ep *ep, const nng_sockaddr *peer_addr)
+{
+	uint64_t  id = nng_sockaddr_hash(peer_addr);
+	udp_pipe *p;
+
+	// we'll keep incrementing id until we conclusively match
+	// or we get a NULL.  This is another level of rehashing, but
+	// it keeps us from having to look up.
+	for (;;) {
+		if ((p = nni_id_get(&ep->mesh_pipes, id)) == NULL) {
+			return (NULL);
+		}
+		if (nng_sockaddr_equal(&p->peer_addr, peer_addr)) {
+			return (p);
+		}
+		id++;
+		if (id == 0) {
+			id = 1;
+		}
+	}
+}
+
+static void
+udp_remove_mesh_pipe(udp_pipe *p)
+{
+	// ep locked
+	udp_ep  *ep = p->ep;
+	uint64_t id = p->id;
+	if (id == 0) {
+		return;
+	}
+	p->id = 0;
+	for (;;) {
+		udp_pipe *srch;
+		if ((srch = nni_id_get(&ep->mesh_pipes, id)) == NULL) {
+			break;
+		}
+		if (srch == p) {
+			nni_id_remove(&ep->mesh_pipes, id);
+			break;
+		}
+		id++;
+		if (id == 0) {
+			id = 1;
+		}
+	}
+	if (p->state < PIPE_CONN_DONE) {
+		nni_list_node_remove(&p->node);
+		nni_pipe_rele(p->npipe);
+	}
+}
+
+static nng_err
+udp_add_mesh_pipe(udp_ep *ep, udp_pipe *p)
+{
+	// Id must be part of the hash
+	uint64_t id = p->id;
+	while (nni_id_get(&ep->mesh_pipes, id) != NULL) {
+		id++;
+		if (id == 0) {
+			id = 1;
+		}
+	}
+	return (nni_id_set(&ep->mesh_pipes, id, p));
 }
 
 static void
@@ -552,6 +680,48 @@ udp_send_creq(udp_ep *ep, udp_pipe *p)
 }
 
 static void
+udp_send_mesh(udp_ep *ep, nni_aio *aio)
+{
+	nng_msg *msg = NULL;
+	size_t   count = 0;
+	if (!ep->ismesh)
+		return;
+
+	nng_log_info("UDP-MESH", "Ping...");
+
+	if (aio)
+		msg = nni_aio_get_msg(aio);
+	if (msg)
+		count = nni_msg_len(msg) + nni_msg_header_len(msg);
+
+	nni_mtx_lock(&ep->mtx);
+
+	udp_sp_msg mesh;
+	mesh.us_ver     = 0x1;
+	mesh.us_op_code = OPCODE_MESH;
+	mesh.us_type    = ep->proto;
+	mesh.us_length  = (uint16_t) count;
+
+	ep->next_mesh = nni_clock() + NNG_UDP_MESH_REFRESH;
+
+	udp_queue_tx(ep, &ep->mesh_mcast_addr, (void *) &mesh, msg);
+	nni_mtx_unlock(&ep->mtx);
+
+	if (aio)
+		nni_aio_finish(aio, 0, count);
+}
+
+static void
+udp_send_meshack(udp_ep *ep, const nng_sockaddr *sa)
+{
+	udp_sp_msg meshack;
+	meshack.us_ver     = 0x01;
+	meshack.us_op_code = OPCODE_MACK;
+	meshack.us_type    = ep->proto;
+	udp_queue_tx(ep, sa, (void *) &meshack, NULL);
+}
+
+static void
 udp_send_cack(udp_ep *ep, udp_pipe *p)
 {
 	udp_sp_msg cack;
@@ -745,12 +915,99 @@ udp_recv_creq(udp_ep *ep, udp_sp_msg *creq, nng_sockaddr *sa)
 }
 
 static void
+udp_recv_mesh(udp_ep *ep, udp_sp_msg *mesh, nng_sockaddr *sa)
+{
+	udp_pipe    *p;
+	nni_time     now;
+	nng_sockaddr peer_sa;
+	char         addr_str[128];
+	char         url_str[150];
+	char         buf[128];
+
+	now = nni_clock();
+
+	if (ep->closed || !ep->ismesh) {
+		// endpoint is closing down, just drop it without further ado
+		return;
+	}
+
+	if (p->peer != mesh->us_type) {
+		return;
+	}
+
+	if ((p = udp_find_mesh_pipe(ep, sa))) {
+		p->expire = now + NNG_UDP_MESH_TIMEOUT;
+		nng_log_info("UDP-MESH", "KeepAlive from %s",
+				nng_str_sockaddr(&p->peer_addr, buf, sizeof(buf)));
+		return;
+	}
+	// TODO continue when it's not myself
+
+	// new pipe
+	memcpy(&peer_sa, sa, sizeof(peer_sa));
+	uint8_t *sa_arr = (uint8_t *)&peer_sa.s_in.sa_addr;
+	sprintf(addr_str, "%d.%d.%d.%d", sa_arr[0], sa_arr[1], sa_arr[2], sa_arr[3]);
+	snprintf(url_str, sizeof(url_str), "udp://%s", addr_str);
+	nng_log_info("NNG-UDP-MESH", "Discovery from %s", url_str);
+
+	if (nni_pipe_alloc_listener((void **) &p, ep->nlistener) != 0) {
+		nng_log_err("NNG-UDP-MESH", "Failed to alloc new pipe for mesh");
+		return;
+	}
+
+	if (udp_mesh_pipe_start(p, ep, &peer_sa) != NNG_OK) {
+		nng_log_err("NNG-UDP-MESH", "Failed to start new pipe for mesh");
+		udp_mesh_pipe_close(p);
+		return;
+	}
+
+	p->peer = mesh->us_type;
+
+	nng_log_info("NNG-UDP-MESH", "Pong to %s",
+			nng_str_sockaddr(&p->peer_addr, buf, sizeof(buf)));
+	udp_send_meshack(ep, &p->peer_addr);
+}
+
+static void
+udp_recv_meshack(udp_ep *ep, udp_sp_msg *meshack, const nng_sockaddr *sa)
+{
+	udp_pipe *p;
+	nni_time  now;
+
+	if (!ep->ismesh)
+		return;
+	NNI_ARG_UNUSED(meshack);
+
+	if ((p = udp_find_mesh_pipe(ep, sa)) && (!p->closed)) {
+		now = nni_clock();
+		p->expire = now + NNG_UDP_MESH_TIMEOUT;
+		return;
+	}
+	if (p) {
+		// TODO reset closed to false? or do something to quic reconnect?
+	} else {
+		// add new pipe
+		if (nni_pipe_alloc_listener((void **) &p, ep->nlistener) != 0) {
+			nng_log_err("NNG-UDP-MESH", "Failed to alloc new pipe for mesh");
+			return;
+		}
+		if (udp_mesh_pipe_start(p, ep, sa) != NNG_OK) {
+			nng_log_err("NNG-UDP-MESH", "Failed to start new pipe for mesh");
+			udp_mesh_pipe_close(p);
+			return;
+		}
+	}
+	p->peer = meshack->us_type;
+}
+
+static void
 udp_recv_cack(udp_ep *ep, udp_sp_msg *cack, const nng_sockaddr *sa)
 {
 	udp_pipe *p;
 	nni_time  now;
 
 	if ((p = udp_find_pipe(ep, sa)) && (!p->closed)) {
+
 		if (p->peer != cack->us_type) {
 			udp_send_disc(ep, p, DISC_TYPE);
 			return;
@@ -871,9 +1128,12 @@ udp_rx_cb(void *arg)
 		case OPCODE_DISC:
 			udp_recv_disc(ep, hdr, sa);
 			break;
-		case OPCODE_MESH: // TODO:
-		                  // udp_recv_mesh(ep, &hdr->mesh, sa);
-		                  // break;
+		case OPCODE_MESH:
+			udp_recv_mesh(ep, hdr, sa);
+			break;
+		case OPCODE_MACK:
+			udp_recv_meshack(ep, hdr, sa);
+			break;
 		default:
 			udp_send_disc_full(ep, sa, DISC_PROTO);
 			break;
@@ -973,6 +1233,33 @@ udp_pipe_recv(void *arg, nni_aio *aio)
 	nni_mtx_unlock(&ep->mtx);
 }
 
+static int
+udp_mesh_join(udp_ep *ep)
+{
+	nng_err rv;
+	nng_sockaddr mcast_addr;
+
+	if (!ep->ismesh)
+		return NNG_OK;
+
+	mcast_addr.s_in.sa_family = NNG_AF_INET;
+	rv = nni_parse_ip(NNG_UDP_MESH_MCAST_ADDR_V4, &mcast_addr);
+	if (rv != 0)
+		return rv;
+	mcast_addr.s_in.sa_port = htons(NNG_UDP_MESH_PORT);
+
+	ep->mesh_mcast_addr = mcast_addr;
+	return nng_udp_multicast_membership(ep->udp, &mcast_addr, true);
+}
+
+static int
+udp_mesh_leave(udp_ep *ep)
+{
+	if (!ep->ismesh)
+		return NNG_OK;
+	return nng_udp_multicast_membership(ep->udp, &ep->mesh_sa, false);
+}
+
 static uint16_t
 udp_pipe_peer(void *arg)
 {
@@ -1020,6 +1307,7 @@ udp_ep_fini(void *arg)
 	udp_ep *ep = arg;
 
 	nni_aio_fini(&ep->timeaio);
+	nni_aio_fini(&ep->mesh_timeaio);
 	nni_aio_fini(&ep->resaio);
 	nni_aio_fini(&ep->tx_aio);
 	nni_aio_fini(&ep->rx_aio);
@@ -1049,10 +1337,15 @@ udp_ep_close(void *arg)
 	nni_mtx_lock(&ep->mtx);
 	ep->closed = true;
 
+	if (ep->ismesh) {
+		udp_mesh_leave(ep);
+	}
+
 	// leave tx open so we can send disconnects
 	nni_aio_close(&ep->resaio);
 	nni_aio_close(&ep->rx_aio);
 	nni_aio_close(&ep->timeaio);
+	nni_aio_close(&ep->mesh_timeaio);
 
 	// close all the underlying pipes, so the peer can see it.
 	while (nni_id_visit(&ep->pipes, &key, (void **) &p, &cursor)) {
@@ -1073,6 +1366,7 @@ udp_ep_stop(void *arg)
 	nni_aio_stop(&ep->resaio);
 	nni_aio_stop(&ep->rx_aio);
 	nni_aio_stop(&ep->timeaio);
+	nni_aio_stop(&ep->mesh_timeaio);
 
 	// We optionally linger a little bit (up to a half second)
 	// so that the disconnect messages can get pushed out.  On
@@ -1095,6 +1389,55 @@ udp_ep_stop(void *arg)
 
 	// finally close the tx channel
 	nni_aio_stop(&ep->tx_aio);
+}
+
+// timer handler for mesh - sends out mesh as needed,
+// reaps stale connections, and handles linger.
+static void
+udp_mesh_timer_cb(void *arg)
+{
+	udp_ep   *ep = arg;
+	udp_pipe *p;
+	int       rv;
+
+	if (!ep->ismesh)
+		return;
+
+	nni_mtx_lock(&ep->mtx);
+	rv = nni_aio_result(&ep->mesh_timeaio);
+	switch (rv) {
+	case NNG_ECLOSED:
+	case NNG_ECANCELED:
+	case NNG_ESTOPPED:
+		nni_mtx_unlock(&ep->mtx);
+		return;
+	default:
+		if (ep->closed) {
+			nni_mtx_unlock(&ep->mtx);
+			return;
+		}
+		break;
+	}
+
+	uint32_t cursor = 0;
+	nni_time now    = nni_clock();
+
+	while (nni_id_visit(&ep->pipes, NULL, (void **) &p, &cursor)) {
+		if (now > p->expire) {
+			char buf[128];
+			nng_log_info("NNG-UDP-MESH-INACTIVE",
+			    "Pipe peer %s timed out due to inactivity",
+			    nng_str_sockaddr(&p->peer_addr, buf, sizeof(buf)));
+
+			udp_remove_mesh_pipe(p);
+			continue;
+		}
+	}
+	nni_sleep_aio(NNG_UDP_MESH_REFRESH, &ep->mesh_timeaio);
+
+	nni_mtx_unlock(&ep->mtx);
+
+	udp_send_mesh(ep, NULL);
 }
 
 // timer handler - sends out additional creqs as needed,
@@ -1182,12 +1525,14 @@ udp_ep_init(
 
 	nni_mtx_init(&ep->mtx);
 	nni_id_map_init(&ep->pipes, 1, 0xFFFFFFFF, true);
+	nni_id_map_init(&ep->mesh_pipes, 1, 0xFFFFFFFF, true);
 	NNI_LIST_INIT(&ep->connpipes, udp_pipe, node);
 	nni_aio_list_init(&ep->connaios);
 
 	nni_aio_init(&ep->rx_aio, udp_rx_cb, ep);
 	nni_aio_init(&ep->tx_aio, udp_tx_cb, ep);
 	nni_aio_init(&ep->timeaio, udp_timer_cb, ep);
+	nni_aio_init(&ep->timeaio, udp_mesh_timer_cb, ep);
 	nni_aio_init(&ep->resaio, udp_resolv_cb, ep);
 	nni_aio_completions_init(&ep->complq);
 
@@ -1220,6 +1565,8 @@ udp_ep_init(
 		NNI_FREE_STRUCTS(ep->tx_ring.descs, NNG_UDP_TXQUEUE_LEN);
 		return (rv);
 	}
+
+	ep->ismesh = false;
 
 	NNI_STAT_LOCK(rcv_max_info, "rcv_max", "maximum receive size",
 	    NNG_STAT_LEVEL, NNG_UNIT_BYTES);
@@ -1291,6 +1638,7 @@ udp_ep_init(
 	// adjusted automatically as we add pipes or other
 	// actions which require earlier wakeup.
 	nni_sleep_aio(NNG_DURATION_INFINITE, &ep->timeaio);
+	nni_sleep_aio(NNG_DURATION_INFINITE, &ep->mesh_timeaio);
 
 	return (0);
 }
@@ -1477,6 +1825,25 @@ udp_ep_connect(void *arg, nni_aio *aio)
 }
 
 static nng_err
+udp_ep_set_mesh_mode(void *arg, const void *v, size_t sz, nni_opt_type t)
+{
+	udp_ep *ep = arg;
+	bool    val;
+	nng_err rv;
+
+	if ((rv = nni_copyin_bool(&val, v, sz, t)) == NNG_OK) {
+		nni_mtx_lock(&ep->mtx);
+		if (ep->started) {
+			nni_mtx_unlock(&ep->mtx);
+			return (NNG_EBUSY);
+		}
+		ep->ismesh = val;
+		nni_mtx_unlock(&ep->mtx);
+	}
+	return (rv);
+}
+
+static nng_err
 udp_ep_get_port(void *arg, void *buf, size_t *szp, nni_type t)
 {
 	udp_ep      *ep = arg;
@@ -1641,9 +2008,22 @@ udp_ep_bind(void *arg, nng_url *url)
 	nng_sockaddr sa;
 	nng_udp_sockname(ep->udp, &sa);
 	url->u_port = nng_sockaddr_port(&sa);
+
+	if (ep->ismesh) {
+		if ((rv = udp_mesh_join(ep)) != NNG_OK) {
+			nng_udp_close(ep->udp);
+			ep->udp = NULL;
+			nni_mtx_unlock(&ep->mtx);
+			return rv;
+		}
+		ep->next_mesh = nni_clock() + NNG_UDP_MESH_REFRESH;
+	}
+
 	udp_ep_start(ep);
 	nni_mtx_unlock(&ep->mtx);
 
+	if (ep->ismesh)
+		udp_send_mesh(ep, NULL);
 	return (rv);
 }
 
@@ -1706,6 +2086,11 @@ static const nni_option udp_ep_opts[] = {
 	{
 	    .o_name = NNG_OPT_BOUND_PORT,
 	    .o_get  = udp_ep_get_port,
+	},
+	{
+		.o_name = NNG_OPT_UDP_MESH_MODE,
+		.o_get  = NULL,
+		.o_set  = udp_ep_set_mesh_mode,
 	},
 	// terminate list
 	{

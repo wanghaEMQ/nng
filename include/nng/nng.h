@@ -845,6 +845,8 @@ NNG_DECL nng_listener nng_pipe_listener(nng_pipe);
 // to replace a full message buffer.
 #define NNG_OPT_UDP_COPY_MAX "udp:copy-max"
 
+#define NNG_OPT_UDP_MESH_MODE "udp:mesh-mode"
+
 // IPC options.  These will largely vary depending on the platform,
 // as POSIX systems have very different options than Windows.
 
