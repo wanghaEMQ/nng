@@ -1678,6 +1678,10 @@ NNG_DECL bool  nng_id_visit(nng_id_map *, uint64_t *, void **, uint32_t *);
 NNG_DECL int nng_bus0_open(nng_socket *);
 NNG_DECL int nng_bus0_open_raw(nng_socket *);
 
+// BUS1
+NNG_DECL int nng_bus1_open(nng_socket *);
+NNG_DECL int nng_bus1_open_raw(nng_socket *);
+
 // PAIR0
 NNG_DECL int nng_pair0_open(nng_socket *);
 NNG_DECL int nng_pair0_open_raw(nng_socket *);
