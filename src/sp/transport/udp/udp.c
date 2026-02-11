@@ -687,7 +687,7 @@ udp_send_mesh(udp_ep *ep, nni_aio *aio)
 	if (!ep->ismesh)
 		return;
 
-	nng_log_info("UDP-MESH", "Ping...");
+	nng_log_info("NNG-UDP-MESH", "Ping -> %s:%d", NNG_UDP_MESH_MCAST_ADDR_V4, NNG_UDP_MESH_PORT);
 
 	if (aio)
 		msg = nni_aio_get_msg(aio);
@@ -920,18 +920,12 @@ udp_recv_mesh(udp_ep *ep, udp_sp_msg *mesh, nng_sockaddr *sa)
 	udp_pipe    *p;
 	nni_time     now;
 	nng_sockaddr peer_sa;
-	char         addr_str[128];
-	char         url_str[150];
 	char         buf[128];
 
 	now = nni_clock();
 
 	if (ep->closed || !ep->ismesh) {
 		// endpoint is closing down, just drop it without further ado
-		return;
-	}
-
-	if (p->peer != mesh->us_type) {
 		return;
 	}
 
@@ -945,10 +939,8 @@ udp_recv_mesh(udp_ep *ep, udp_sp_msg *mesh, nng_sockaddr *sa)
 
 	// new pipe
 	memcpy(&peer_sa, sa, sizeof(peer_sa));
-	uint8_t *sa_arr = (uint8_t *)&peer_sa.s_in.sa_addr;
-	sprintf(addr_str, "%d.%d.%d.%d", sa_arr[0], sa_arr[1], sa_arr[2], sa_arr[3]);
-	snprintf(url_str, sizeof(url_str), "udp://%s", addr_str);
-	nng_log_info("NNG-UDP-MESH", "Discovery from %s", url_str);
+	nng_log_info("NNG-UDP-MESH", "Discovery New Node From %s",
+			nng_str_sockaddr(&peer_sa, buf, sizeof(buf)));
 
 	if (nni_pipe_alloc_listener((void **) &p, ep->nlistener) != 0) {
 		nng_log_err("NNG-UDP-MESH", "Failed to alloc new pipe for mesh");
@@ -963,7 +955,7 @@ udp_recv_mesh(udp_ep *ep, udp_sp_msg *mesh, nng_sockaddr *sa)
 
 	p->peer = mesh->us_type;
 
-	nng_log_info("NNG-UDP-MESH", "Pong to %s",
+	nng_log_info("NNG-UDP-MESH", "Pong -> %s",
 			nng_str_sockaddr(&p->peer_addr, buf, sizeof(buf)));
 	udp_send_meshack(ep, &p->peer_addr);
 }
@@ -1074,6 +1066,7 @@ udp_rx_cb(void *arg)
 	if ((rv = nni_aio_result(aio)) != 0) {
 		// something bad happened on RX... which is unexpected.
 		// sleep a little bit and hope for recovery.
+		nng_log_warn("UDP-RX", "rx callback rv %d", rv);
 		switch (nni_aio_result(aio)) {
 		case NNG_ECLOSED:
 		case NNG_ECANCELED:
@@ -1249,6 +1242,7 @@ udp_mesh_join(udp_ep *ep)
 	mcast_addr.s_in.sa_port = htons(NNG_UDP_MESH_PORT);
 
 	ep->mesh_mcast_addr = mcast_addr;
+	nng_log_warn("NNG-UDP-MESH", "Join Multicast Group %s", NNG_UDP_MESH_MCAST_ADDR_V4);
 	return nng_udp_multicast_membership(ep->udp, &mcast_addr, true);
 }
 
@@ -1257,6 +1251,7 @@ udp_mesh_leave(udp_ep *ep)
 {
 	if (!ep->ismesh)
 		return NNG_OK;
+	nng_log_warn("NNG-UDP-MESH", "Leave Multicast Group %s", NNG_UDP_MESH_MCAST_ADDR_V4);
 	return nng_udp_multicast_membership(ep->udp, &ep->mesh_sa, false);
 }
 
@@ -1403,6 +1398,8 @@ udp_mesh_timer_cb(void *arg)
 	if (!ep->ismesh)
 		return;
 
+	nng_log_info("NNG-UDP-MESH", "Timer Callback");
+
 	nni_mtx_lock(&ep->mtx);
 	rv = nni_aio_result(&ep->mesh_timeaio);
 	switch (rv) {
@@ -1532,7 +1529,7 @@ udp_ep_init(
 	nni_aio_init(&ep->rx_aio, udp_rx_cb, ep);
 	nni_aio_init(&ep->tx_aio, udp_tx_cb, ep);
 	nni_aio_init(&ep->timeaio, udp_timer_cb, ep);
-	nni_aio_init(&ep->timeaio, udp_mesh_timer_cb, ep);
+	nni_aio_init(&ep->mesh_timeaio, udp_mesh_timer_cb, ep);
 	nni_aio_init(&ep->resaio, udp_resolv_cb, ep);
 	nni_aio_completions_init(&ep->complq);
 
@@ -2000,13 +1997,17 @@ udp_ep_bind(void *arg, nng_url *url)
 		return (NNG_EBUSY);
 	}
 
+	nng_log_warn(NULL, "nng_udp_open %d:%d:%d", ep->self_sa.s_in.sa_family,
+			ep->self_sa.s_in.sa_addr, ep->self_sa.s_in.sa_port);
 	rv = nng_udp_open(&ep->udp, &ep->self_sa);
 	if (rv != NNG_OK) {
 		nni_mtx_unlock(&ep->mtx);
 		return (rv);
 	}
 	nng_sockaddr sa;
-	nng_udp_sockname(ep->udp, &sa);
+	if ((rv = nng_udp_sockname(ep->udp, &sa)) != 0) {
+		nng_log_err(NULL, "nng_udp_sockname failed");
+	}
 	url->u_port = nng_sockaddr_port(&sa);
 
 	if (ep->ismesh) {
@@ -2022,8 +2023,9 @@ udp_ep_bind(void *arg, nng_url *url)
 	udp_ep_start(ep);
 	nni_mtx_unlock(&ep->mtx);
 
-	if (ep->ismesh)
-		udp_send_mesh(ep, NULL);
+	if (ep->ismesh) {
+		nni_aio_abort(&ep->mesh_timeaio, NNG_EINTR);
+	}
 	return (rv);
 }
 
