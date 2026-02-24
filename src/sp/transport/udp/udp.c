@@ -185,6 +185,7 @@ struct udp_ep {
 	nni_aio       mesh_timeaio;
 	bool          ismesh;
 	nni_id_map    mesh_pipes;  // pipes (indexed by id)
+	char *        mesh_payload;
 	nng_time      next_mesh;
 	nni_list      connaios;   // aios from accept waiting for a client peer
 	nni_list      connpipes;  // pipes waiting to be connected
@@ -687,10 +688,14 @@ udp_send_mesh(udp_ep *ep, nni_aio *aio)
 	if (!ep->ismesh)
 		return;
 
-	nng_log_info("NNG-UDP-MESH", "Ping -> %s:%d", NNG_UDP_MESH_MCAST_ADDR_V4, NNG_UDP_MESH_PORT);
+	nng_log_info("NNG-UDP-MESH", "Ping -> %s -> %s:%d", ep->mesh_payload,
+			NNG_UDP_MESH_MCAST_ADDR_V4, NNG_UDP_MESH_PORT);
 
-	if (aio)
-		msg = nni_aio_get_msg(aio);
+	if (ep->mesh_payload) {
+		size_t pldsz = strlen(ep->mesh_payload);
+		nng_msg_alloc(&msg, 0);
+		nng_msg_append(msg, ep->mesh_payload, pldsz);
+	}
 	if (msg)
 		count = nni_msg_len(msg) + nni_msg_header_len(msg);
 
@@ -915,18 +920,33 @@ udp_recv_creq(udp_ep *ep, udp_sp_msg *creq, nng_sockaddr *sa)
 }
 
 static void
-udp_recv_mesh(udp_ep *ep, udp_sp_msg *mesh, nng_sockaddr *sa)
+udp_recv_mesh(udp_ep *ep, udp_sp_msg *mesh, size_t len, nng_sockaddr *sa)
 {
 	udp_pipe    *p;
 	nni_time     now;
 	nng_sockaddr peer_sa;
 	char         buf[128];
+	nng_msg     *msg = NULL;
 
 	now = nni_clock();
 
 	if (ep->closed || !ep->ismesh) {
 		// endpoint is closing down, just drop it without further ado
 		return;
+	}
+
+	// trim the message down to its
+	nni_msg_chop(
+	    ep->rx_payload, nni_msg_len(ep->rx_payload) - mesh->us_length);
+	if (len > 0) {
+		if (nng_msg_alloc(&msg, len) != 0) {
+			nng_log_err(NULL, "failed to alloc msg for mesh");
+			return;
+		}
+		nni_msg_set_address(msg, sa);
+		memcpy(nni_msg_body(msg), nni_msg_body(ep->rx_payload), len);
+		// reset rx msg
+		nni_msg_realloc(ep->rx_payload, ep->rcvmax);
 	}
 
 	if ((p = udp_find_mesh_pipe(ep, sa))) {
@@ -955,7 +975,7 @@ udp_recv_mesh(udp_ep *ep, udp_sp_msg *mesh, nng_sockaddr *sa)
 
 	p->peer = mesh->us_type;
 
-	nng_log_info("NNG-UDP-MESH", "Pong -> %s",
+	nng_log_info("NNG-UDP-MESH", "Pong -> %s -> %s", msg ? nng_msg_body(msg) : NULL,
 			nng_str_sockaddr(&p->peer_addr, buf, sizeof(buf)));
 	udp_send_meshack(ep, &p->peer_addr);
 }
@@ -1122,7 +1142,7 @@ udp_rx_cb(void *arg)
 			udp_recv_disc(ep, hdr, sa);
 			break;
 		case OPCODE_MESH:
-			udp_recv_mesh(ep, hdr, sa);
+			udp_recv_mesh(ep, hdr, n, sa);
 			break;
 		case OPCODE_MACK:
 			udp_recv_meshack(ep, hdr, sa);
@@ -1564,6 +1584,7 @@ udp_ep_init(
 	}
 
 	ep->ismesh = false;
+	ep->mesh_payload = NULL;
 
 	NNI_STAT_LOCK(rcv_max_info, "rcv_max", "maximum receive size",
 	    NNG_STAT_LEVEL, NNG_UNIT_BYTES);
@@ -1841,6 +1862,30 @@ udp_ep_set_mesh_mode(void *arg, const void *v, size_t sz, nni_opt_type t)
 }
 
 static nng_err
+udp_ep_set_mesh_payload(void *arg, const void *v, size_t sz, nni_opt_type t)
+{
+	nng_err rv;
+	udp_ep *ep = arg;
+	char *  val = NULL;
+
+	if (v == NULL || sz == 0) {
+		nni_mtx_lock(&ep->mtx);
+		ep->mesh_payload = val;
+		nni_mtx_unlock(&ep->mtx);
+		return 0;
+	}
+
+	val = nng_alloc(sizeof(char) * sz);
+	if ((rv = nni_copyin_str(val, v, sz, t)) == NNG_OK) {
+		nni_mtx_lock(&ep->mtx);
+		ep->mesh_payload = val;
+		nng_log_info(NULL, "mesh payload: %s", val);
+		nni_mtx_unlock(&ep->mtx);
+	}
+	return (rv);
+}
+
+static nng_err
 udp_ep_get_port(void *arg, void *buf, size_t *szp, nni_type t)
 {
 	udp_ep      *ep = arg;
@@ -2093,6 +2138,11 @@ static const nni_option udp_ep_opts[] = {
 		.o_name = NNG_OPT_UDP_MESH_MODE,
 		.o_get  = NULL,
 		.o_set  = udp_ep_set_mesh_mode,
+	},
+	{
+		.o_name = NNG_OPT_UDP_MESH_PAYLOAD,
+		.o_get  = NULL,
+		.o_set  = udp_ep_set_mesh_payload,
 	},
 	// terminate list
 	{
