@@ -147,6 +147,7 @@ struct udp_pipe {
 	nng_time       next_wake;
 	nng_time       next_creq;
 	nng_time       expire;
+	nng_msg       *meshmsg;
 	nni_list_node  node;
 	nni_lmq        rx_mq;
 	nni_list       rx_aios;
@@ -293,7 +294,7 @@ udp_pipe_init(void *arg, nni_pipe *npipe)
 }
 
 static nng_err
-udp_mesh_pipe_start(udp_pipe *p, udp_ep *ep, const nng_sockaddr *sa)
+udp_mesh_pipe_start(udp_pipe *p, udp_ep *ep, const nng_sockaddr *sa, nng_msg *meshmsg)
 {
 	nni_time now = nni_clock();
 	p->ep        = ep;
@@ -302,6 +303,7 @@ udp_mesh_pipe_start(udp_pipe *p, udp_ep *ep, const nng_sockaddr *sa)
 	p->peer_addr = *sa;
 	p->id        = nng_sockaddr_hash(sa);
 	p->expire    = now + NNG_UDP_MESH_TIMEOUT;
+	p->meshmsg   = meshmsg;
 
 	return (udp_add_mesh_pipe(ep, p));
 }
@@ -717,13 +719,25 @@ udp_send_mesh(udp_ep *ep, nni_aio *aio)
 }
 
 static void
-udp_send_meshack(udp_ep *ep, const nng_sockaddr *sa)
+udp_send_meshack(udp_ep *ep, const nng_sockaddr *sa, char *mesh_payload)
 {
 	udp_sp_msg meshack;
 	meshack.us_ver     = 0x01;
 	meshack.us_op_code = OPCODE_MACK;
 	meshack.us_type    = ep->proto;
-	udp_queue_tx(ep, sa, (void *) &meshack, NULL);
+
+	nng_msg *msg   = NULL;
+	size_t   count = 0;
+
+	if (mesh_payload) {
+		size_t pldsz = strlen(ep->mesh_payload);
+		nng_msg_alloc(&msg, 0);
+		nng_msg_append(msg, ep->mesh_payload, pldsz);
+		count = nni_msg_len(msg) + nni_msg_header_len(msg);
+	}
+
+	meshack.us_length  = (uint16_t) count;
+	udp_queue_tx(ep, sa, (void *) &meshack, msg);
 }
 
 static void
@@ -938,6 +952,15 @@ udp_recv_mesh(udp_ep *ep, udp_sp_msg *mesh, size_t len, nng_sockaddr *sa)
 	// trim the message down to its
 	nni_msg_chop(
 	    ep->rx_payload, nni_msg_len(ep->rx_payload) - mesh->us_length);
+
+	if ((p = udp_find_mesh_pipe(ep, sa))) {
+		p->expire = now + NNG_UDP_MESH_TIMEOUT;
+		nng_log_info("UDP-UDP-MESH", "Ping <- KeepAlive from %s",
+				nng_str_sockaddr(&p->peer_addr, buf, sizeof(buf)));
+		return;
+	}
+	// TODO continue when it's not myself
+
 	if (len > 0) {
 		if (nng_msg_alloc(&msg, len) != 0) {
 			nng_log_err(NULL, "failed to alloc msg for mesh");
@@ -949,17 +972,9 @@ udp_recv_mesh(udp_ep *ep, udp_sp_msg *mesh, size_t len, nng_sockaddr *sa)
 		nni_msg_realloc(ep->rx_payload, ep->rcvmax);
 	}
 
-	if ((p = udp_find_mesh_pipe(ep, sa))) {
-		p->expire = now + NNG_UDP_MESH_TIMEOUT;
-		nng_log_info("UDP-MESH", "KeepAlive from %s",
-				nng_str_sockaddr(&p->peer_addr, buf, sizeof(buf)));
-		return;
-	}
-	// TODO continue when it's not myself
-
 	// new pipe
 	memcpy(&peer_sa, sa, sizeof(peer_sa));
-	nng_log_info("NNG-UDP-MESH", "Discovery New Node From %s",
+	nng_log_info("NNG-UDP-MESH", "Ping <- Discovery New Node From %s",
 			nng_str_sockaddr(&peer_sa, buf, sizeof(buf)));
 
 	if (nni_pipe_alloc_listener((void **) &p, ep->nlistener) != 0) {
@@ -967,7 +982,7 @@ udp_recv_mesh(udp_ep *ep, udp_sp_msg *mesh, size_t len, nng_sockaddr *sa)
 		return;
 	}
 
-	if (udp_mesh_pipe_start(p, ep, &peer_sa) != NNG_OK) {
+	if (udp_mesh_pipe_start(p, ep, &peer_sa, msg) != NNG_OK) {
 		nng_log_err("NNG-UDP-MESH", "Failed to start new pipe for mesh");
 		udp_mesh_pipe_close(p);
 		return;
@@ -977,33 +992,54 @@ udp_recv_mesh(udp_ep *ep, udp_sp_msg *mesh, size_t len, nng_sockaddr *sa)
 
 	nng_log_info("NNG-UDP-MESH", "Pong -> %s -> %s", msg ? nng_msg_body(msg) : NULL,
 			nng_str_sockaddr(&p->peer_addr, buf, sizeof(buf)));
-	udp_send_meshack(ep, &p->peer_addr);
+	udp_send_meshack(ep, &p->peer_addr, ep->mesh_payload);
 }
 
 static void
-udp_recv_meshack(udp_ep *ep, udp_sp_msg *meshack, const nng_sockaddr *sa)
+udp_recv_meshack(udp_ep *ep, udp_sp_msg *meshack, size_t len, const nng_sockaddr *sa)
 {
 	udp_pipe *p;
 	nni_time  now;
+	char      buf[128];
 
 	if (!ep->ismesh)
 		return;
-	NNI_ARG_UNUSED(meshack);
 
 	if ((p = udp_find_mesh_pipe(ep, sa)) && (!p->closed)) {
 		now = nni_clock();
 		p->expire = now + NNG_UDP_MESH_TIMEOUT;
+		nng_log_info("UDP-UDP-MESH", "Pong <- Node %s already exists",
+				nng_str_sockaddr(sa, buf, sizeof(buf)));
 		return;
 	}
+
+	// trim the message down to its
+	nni_msg_chop(
+	    ep->rx_payload, nni_msg_len(ep->rx_payload) - meshack->us_length);
+
 	if (p) {
 		// TODO reset closed to false? or do something to quic reconnect?
 	} else {
+		nng_msg *msg = NULL;
+		if (len > 0) {
+			if (nng_msg_alloc(&msg, len) != 0) {
+				nng_log_err(NULL, "failed to alloc msg for mesh");
+				return;
+			}
+			nni_msg_set_address(msg, sa);
+			memcpy(nni_msg_body(msg), nni_msg_body(ep->rx_payload), len);
+			// reset rx msg
+			nni_msg_realloc(ep->rx_payload, ep->rcvmax);
+		}
+
 		// add new pipe
 		if (nni_pipe_alloc_listener((void **) &p, ep->nlistener) != 0) {
 			nng_log_err("NNG-UDP-MESH", "Failed to alloc new pipe for mesh");
 			return;
 		}
-		if (udp_mesh_pipe_start(p, ep, sa) != NNG_OK) {
+		nng_log_info("NNG-UDP-MESH", "Pong <- payload %s from meshack",
+				msg ? nng_msg_body(msg) : NULL);
+		if (udp_mesh_pipe_start(p, ep, sa, msg) != NNG_OK) {
 			nng_log_err("NNG-UDP-MESH", "Failed to start new pipe for mesh");
 			udp_mesh_pipe_close(p);
 			return;
@@ -1145,7 +1181,7 @@ udp_rx_cb(void *arg)
 			udp_recv_mesh(ep, hdr, n, sa);
 			break;
 		case OPCODE_MACK:
-			udp_recv_meshack(ep, hdr, sa);
+			udp_recv_meshack(ep, hdr, n, sa);
 			break;
 		default:
 			udp_send_disc_full(ep, sa, DISC_PROTO);
@@ -1184,6 +1220,7 @@ udp_pipe_send(void *arg, nni_aio *aio)
 
 	nni_aio_reset(aio);
 	nni_mtx_lock(&ep->mtx);
+
 	if ((nni_msg_len(msg) + nni_msg_header_len(msg)) > p->sndmax) {
 		nni_mtx_unlock(&ep->mtx);
 		// rather failing this with an error, we just drop it on
@@ -1418,7 +1455,7 @@ udp_mesh_timer_cb(void *arg)
 	if (!ep->ismesh)
 		return;
 
-	nng_log_info("NNG-UDP-MESH", "Timer Callback");
+	nng_log_warn("NNG-UDP-MESH", "Timer Callback");
 
 	nni_mtx_lock(&ep->mtx);
 	rv = nni_aio_result(&ep->mesh_timeaio);
