@@ -849,6 +849,8 @@ NNG_DECL nng_listener nng_pipe_listener(nng_pipe);
 
 #define NNG_OPT_UDP_MESH_PAYLOAD "udp:mesh-payload"
 
+#define NNG_OPT_UDP_MESH_NODES "udp:mesh-nodes"
+
 // IPC options.  These will largely vary depending on the platform,
 // as POSIX systems have very different options than Windows.
 

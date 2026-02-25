@@ -1923,6 +1923,37 @@ udp_ep_set_mesh_payload(void *arg, const void *v, size_t sz, nni_opt_type t)
 }
 
 static nng_err
+udp_ep_get_mesh_nodes(void *arg, void *v, size_t *szp, nni_opt_type t)
+{
+	udp_ep *      ep = arg;
+	int           arridx = 0;
+	nng_err       rv;
+	uint32_t      cursor = 0;
+	udp_pipe *    p;
+	nng_sockaddr* arr;
+
+	nni_mtx_lock(&ep->mtx);
+
+	if (nni_id_count(&ep->mesh_pipes) == 0) {
+		nng_log_warn("NNG-UDP-MESH", "No mesh pipes found");
+		nni_mtx_unlock(&ep->mtx);
+		return 0;
+	}
+
+	arr = nng_alloc(sizeof(nng_sockaddr) * (1 + nni_id_count(&ep->mesh_pipes)));
+	memset(arr, 0, sizeof(nng_sockaddr) * (1 + nni_id_count(&ep->mesh_pipes)));
+
+	while (nni_id_visit(&ep->mesh_pipes, NULL, (void **) &p, &cursor)) {
+		arr[arridx++] = p->peer_addr;
+	}
+
+	nni_mtx_unlock(&ep->mtx);
+
+	rv = nni_copyout_str((const char*)arr, v, szp, t);
+	return (rv);
+}
+
+static nng_err
 udp_ep_get_port(void *arg, void *buf, size_t *szp, nni_type t)
 {
 	udp_ep      *ep = arg;
@@ -2180,6 +2211,11 @@ static const nni_option udp_ep_opts[] = {
 		.o_name = NNG_OPT_UDP_MESH_PAYLOAD,
 		.o_get  = NULL,
 		.o_set  = udp_ep_set_mesh_payload,
+	},
+	{
+		.o_name = NNG_OPT_UDP_MESH_NODES,
+		.o_get  = udp_ep_get_mesh_nodes,
+		.o_set  = NULL,
 	},
 	// terminate list
 	{
