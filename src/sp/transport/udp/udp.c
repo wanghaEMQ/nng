@@ -1476,7 +1476,7 @@ udp_mesh_timer_cb(void *arg)
 	uint32_t cursor = 0;
 	nni_time now    = nni_clock();
 
-	while (nni_id_visit(&ep->pipes, NULL, (void **) &p, &cursor)) {
+	while (nni_id_visit(&ep->mesh_pipes, NULL, (void **) &p, &cursor)) {
 		if (now > p->expire) {
 			char buf[128];
 			nng_log_info("NNG-UDP-MESH-INACTIVE",
