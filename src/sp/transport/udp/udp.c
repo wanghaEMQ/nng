@@ -1479,7 +1479,7 @@ udp_mesh_timer_cb(void *arg)
 	while (nni_id_visit(&ep->mesh_pipes, NULL, (void **) &p, &cursor)) {
 		if (now > p->expire) {
 			char buf[128];
-			nng_log_info("NNG-UDP-MESH-INACTIVE",
+			nng_log_warn("NNG-UDP-MESH-INACTIVE",
 			    "Pipe peer %s timed out due to inactivity",
 			    nng_str_sockaddr(&p->peer_addr, buf, sizeof(buf)));
 
@@ -1936,6 +1936,7 @@ udp_ep_get_mesh_nodes(void *arg, void *v, size_t *szp, nni_opt_type t)
 
 	if (nni_id_count(&ep->mesh_pipes) == 0) {
 		nng_log_warn("NNG-UDP-MESH", "No mesh pipes found");
+		*(const char **) v = NULL;
 		nni_mtx_unlock(&ep->mtx);
 		return 0;
 	}
